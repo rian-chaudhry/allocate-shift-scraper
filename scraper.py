@@ -96,6 +96,7 @@ def new_context(p):
     if STATE_FILE.exists():
         args["storage_state"] = str(STATE_FILE)
     context = browser.new_context(**args)
+    context.add_init_script("try{ sessionStorage.setItem('setPhoneLogin','false'); }catch(e){}")
     context.set_extra_http_headers({"Accept-Language": "en-GB,en;q=0.9"})
     return browser, context
 
@@ -217,9 +218,10 @@ def perform_login(page):
             capture_artifacts(page, "after_login")
             raise AuthError("Login failed")
         timeout_ms = int(min(60000, max(1000, time_left * 1000)))
+        container_selector = ".auth0-lock-form, .auth0-lock-cred-pane-internal-wrapper"
         try:
             page.wait_for_selector(
-                ".auth0-lock-form, .auth0-lock-cred-pane-internal-wrapper",
+                container_selector,
                 state="visible",
                 timeout=timeout_ms,
             )
@@ -227,24 +229,98 @@ def perform_login(page):
             capture_artifacts(page, "after_login")
             raise AuthError("Auth0 Lock form did not appear")
 
-        container_candidates = page.locator(
-            ".auth0-lock-form, .auth0-lock-cred-pane-internal-wrapper"
-        )
+        container_candidates = page.locator(container_selector)
+        auth0_container = container_candidates.first if container_candidates.count() > 0 else None
+
+        try:
+            page.evaluate("sessionStorage.setItem('setPhoneLogin','false')")
+        except Exception:
+            pass
+        micro_pause()
+        try:
+            page.reload(wait_until="domcontentloaded")
+        except Exception:
+            pass
+        micro_pause()
+
+        try:
+            page.wait_for_selector(
+                container_selector,
+                state="visible",
+                timeout=timeout_ms,
+            )
+        except PWTimeout:
+            capture_artifacts(page, "after_login")
+            raise AuthError("Auth0 Lock form did not reappear")
+        container_candidates = page.locator(container_selector)
         auth0_container = container_candidates.first if container_candidates.count() > 0 else None
 
         email_input = find_visible_input(
-            ["input[type='email']", "input[name='email']"],
+            [
+                "input[type='email']",
+                "input[name='email']",
+                "input[autocomplete='username']",
+                "input[type='text'][name='username']",
+                ".auth0-lock-input input",
+            ],
             container=auth0_container,
         )
         if email_input is None:
+            toggle = page.locator("#btnLoginPhone, button:has-text('Login with username'), button:has-text('Login with phone number')")
+            try:
+                if toggle.count() > 0 and toggle.first.is_visible():
+                    toggle.first.click()
+                    micro_pause()
+                    try:
+                        page.evaluate("sessionStorage.setItem('setPhoneLogin','false')")
+                    except Exception:
+                        pass
+                    micro_pause()
+                    try:
+                        page.reload(wait_until='domcontentloaded')
+                    except Exception:
+                        pass
+                    micro_pause()
+                    try:
+                        page.wait_for_selector(
+                            container_selector,
+                            state="visible",
+                            timeout=timeout_ms,
+                        )
+                    except PWTimeout:
+                        capture_artifacts(page, "after_login")
+                        raise AuthError("Auth0 Lock form did not reappear after toggle")
+                    container_candidates = page.locator(container_selector)
+                    auth0_container = (
+                        container_candidates.first if container_candidates.count() > 0 else None
+                    )
+                    email_input = find_visible_input(
+                        [
+                            "input[type='email']",
+                            "input[name='email']",
+                            "input[autocomplete='username']",
+                            "input[type='text'][name='username']",
+                            ".auth0-lock-input input",
+                        ],
+                        container=auth0_container,
+                    )
+            except Exception:
+                pass
+        if email_input is None:
+            capture_artifacts(page, "auth0_debug")
             capture_artifacts(page, "after_login")
             raise AuthError("Email input not found")
 
         password_input = find_visible_input(
-            ["input[type='password']"],
+            [
+                "input[type='password']",
+                "input[name='password']",
+                ".auth0-lock-input input[type='password']",
+            ],
             container=auth0_container,
         )
         if password_input is None:
+            capture_artifacts(page, "auth0_debug")
             capture_artifacts(page, "after_login")
             raise AuthError("Password input not found")
 
@@ -288,6 +364,7 @@ def perform_login(page):
                 login_button = locator
                 break
         if login_button is None:
+            capture_artifacts(page, "auth0_debug")
             capture_artifacts(page, "after_login")
             raise AuthError("Login button not found")
 
