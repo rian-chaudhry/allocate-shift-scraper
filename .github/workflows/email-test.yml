@@ -1,30 +1,31 @@
 name: Email Test
 
 on:
-  workflow_dispatch:   # lets you trigger it manually from GitHub Actions
+  workflow_dispatch:
 
 jobs:
   send-test-email:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install smtplib email_validator
-
-      - name: Send test email
+      - name: Send test email via SMTP
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          SMTP_TO:   ${{ secrets.SMTP_TO }}
         run: |
-          python - << 'EOF'
+          python - << 'PY'
           import os, ssl, smtplib
           from email.mime.text import MIMEText
 
-          msg = MIMEText("<h3>Hello!</h3><p>This is a test email from your GitHub Action.</p>", "html")
+          msg = MIMEText("<h3>Hello!</h3><p>This is a GitHub Actions SMTP test.</p>", "html")
           msg["From"] = os.environ["SMTP_FROM"]
           msg["To"] = os.environ["SMTP_TO"]
           msg["Subject"] = "✅ GitHub SMTP Test"
@@ -33,12 +34,5 @@ jobs:
           with smtplib.SMTP_SSL(os.environ["SMTP_HOST"], int(os.environ["SMTP_PORT"]), context=ctx) as s:
               s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
               s.sendmail(msg["From"], [msg["To"]], msg.as_string())
-          print("Test email sent successfully!")
-          EOF
-        env:
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          SMTP_FROM: ${{ secrets.SMTP_FROM }}
-          SMTP_TO:   ${{ secrets.SMTP_TO }}
+          print("✅ Test email sent successfully!")
+          PY
