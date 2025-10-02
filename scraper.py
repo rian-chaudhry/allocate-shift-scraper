@@ -58,7 +58,8 @@ def send_email(subject, html):
     msg["To"] = os.environ["SMTP_TO"]
     msg["Subject"] = subject
     ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL(os.environ["SMTP_HOST"], int(os.environ.get("SMTP_PORT", "465")), context=ctx) as s:
+    port = int(os.environ.get("SMTP_PORT") or 465)
+    with smtplib.SMTP_SSL(os.environ["SMTP_HOST"], port, context=ctx) as s:
         s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
         s.sendmail(msg["From"], [msg["To"]], msg.as_string())
 
@@ -130,10 +131,30 @@ def perform_login(page):
         raise CaptchaError("CAPTCHA encountered during login")
     user = os.environ["ALLOCATE_USER"]
     pw = os.environ["ALLOCATE_PASS"]
+
+    try:
+        welcome_text = page.get_by_text(re.compile("welcome to loop", re.I))
+        welcome_login_btn = page.get_by_role("button", name=re.compile("log.?in", re.I))
+        if (
+            welcome_text.count() > 0
+            and welcome_login_btn.count() > 0
+            and welcome_login_btn.first.is_visible()
+        ):
+            print("at welcome card")
+            welcome_login_btn.first.click()
+            print("clicked Log In")
+            page.wait_for_load_state("networkidle", timeout=60000)
+            micro_pause()
+            page.wait_for_selector("input[type='password']", timeout=60000)
+            micro_pause()
+    except Exception:
+        pass
+
     username = page.locator("input[autocomplete='username'], input[type='email'], input[name*='user' i]")
     password = page.locator("input[type='password']")
     if username.count() == 0 or password.count() == 0:
         raise AuthError("Login form not found")
+    print("found login form")
     username.first.click()
     micro_pause()
     username.first.fill(user)
@@ -148,11 +169,14 @@ def perform_login(page):
     if login_btn.count() == 0:
         raise AuthError("Login button not found")
     login_btn.first.click()
+    print("login submitted")
     page.wait_for_load_state("networkidle", timeout=60000)
     micro_pause()
     if detect_captcha(page):
         raise CaptchaError("CAPTCHA encountered after login submit")
-    return not needs_login(page)
+    if needs_login(page):
+        return False
+    return True
 
 
 def ensure_authenticated(page, context, relog_state, force=False):
@@ -177,6 +201,7 @@ def ensure_authenticated(page, context, relog_state, force=False):
 
 def go_to_available_duties(page, keep_auth):
     keep_auth()
+    print("navigating to Available Bank Duties")
     # Side menu → "Available Bank Duties"
     # Many Allocate skins use role="link" with visible name; fallback to text search.
     try:

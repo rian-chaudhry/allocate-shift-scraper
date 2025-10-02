@@ -36,6 +36,7 @@ jobs:
 
       - name: Run scraper
         env:
+          # Provide Allocate + SMTP credentials to the script
           ALLOCATE_USER: ${{ secrets.ALLOCATE_USER }}
           ALLOCATE_PASS: ${{ secrets.ALLOCATE_PASS }}
           SMTP_HOST:     ${{ secrets.SMTP_HOST }}
