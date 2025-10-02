@@ -21,8 +21,10 @@ USER_AGENTS = [
 ]
 
 def jitter_sleep():
-    # 30–120s jitter so we don't look like a metronome
-    delay = random.uniform(30, 120)
+    # Shorter, still human-like jitter: 4–37 seconds
+    import random, time
+    delay = random.uniform(4, 37)
+    print(f"jitter: sleeping {delay:.1f}s before scrape")
     time.sleep(delay)
 
 
