@@ -1,0 +1,56 @@
+name: shift-scraper
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Jitter 30–120s to avoid perfect regularity
+        run: |
+          python - <<'PY'
+          import random, time
+          t = random.uniform(30, 120)
+          print(f"Sleeping {t:.1f}s for jitter")
+          time.sleep(t)
+          PY
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run scraper
+        env:
+          ALLOCATE_USER: ${{ secrets.ALLOCATE_USER }}
+          ALLOCATE_PASS: ${{ secrets.ALLOCATE_PASS }}
+          SMTP_HOST:     ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:     ${{ secrets.SMTP_PORT }}
+          SMTP_USER:     ${{ secrets.SMTP_USER }}
+          SMTP_PASS:     ${{ secrets.SMTP_PASS }}
+          SMTP_FROM:     ${{ secrets.SMTP_FROM }}
+          SMTP_TO:       ${{ secrets.SMTP_TO }}
+        run: python scraper.py
+
+      - name: Persist state files back to repo (seen_ids & storage_state)
+        if: always()
+        run: |
+          git config user.name  "shift-bot"
+          git config user.email "shift-bot@users.noreply.github.com"
+          git add seen_ids.json storage_state.json || true
+          git diff --cached --quiet && echo "No state changes" || git commit -m "Update state [skip ci]"
+          git push || echo "Nothing to push"
