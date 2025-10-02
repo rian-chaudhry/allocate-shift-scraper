@@ -21,14 +21,14 @@ jobs:
     timeout-minutes: 12
 
     steps:
-     - name: Jitter 4–37s to avoid perfect regularity
-  run: |
-    python - <<'PY'
-    import random, time
-    t = random.uniform(4, 37)
-    print(f"jitter: sleeping {t:.1f}s before scrape")
-    time.sleep(t)
-    PY
+      - name: Jitter 4–37s to avoid perfect regularity
+        run: |
+          python - <<'PY'
+          import random, time
+          t = random.uniform(4, 37)
+          print(f"jitter: sleeping {t:.1f}s before scrape")
+          time.sleep(t)
+          PY
 
       - name: Checkout
         uses: actions/checkout@v4
