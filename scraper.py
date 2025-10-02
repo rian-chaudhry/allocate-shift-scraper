@@ -12,6 +12,8 @@ ROOT = Path(__file__).parent
 STATE_FILE = ROOT / "storage_state.json"     # Playwright session (persisted to repo)
 SEEN_FILE  = ROOT / "seen_ids.json"          # Last-seen Request IDs (persisted to repo)
 RULES_FILE = ROOT / "rules.yaml"
+ARTIFACTS_DIR = ROOT / "artifacts"
+VIDEO_TEMP_DIR = ARTIFACTS_DIR / "video"
 
 USER_AGENTS = [
     # keep a few realistic UAs; Playwright already does a lot, this just adds variation
@@ -21,13 +23,31 @@ USER_AGENTS = [
 ]
 
 def jitter_sleep():
-    # 30–120s jitter so we don't look like a metronome
-    delay = random.uniform(30, 120)
+    # 4–37s jitter so we don't look like a metronome
+    delay = random.uniform(4, 37)
     time.sleep(delay)
 
 
 def micro_pause():
     time.sleep(random.uniform(0.3, 1.1))
+
+def ensure_artifact_dirs():
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    VIDEO_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+def capture_artifacts(page, name):
+    ensure_artifact_dirs()
+    png_path = ARTIFACTS_DIR / f"{name}.png"
+    html_path = ARTIFACTS_DIR / f"{name}.html"
+    try:
+        page.screenshot(path=str(png_path), full_page=True)
+    except Exception as exc:
+        print(f"artifact capture failed for {name}.png: {exc}")
+    try:
+        html = page.content()
+        html_path.write_text(html, encoding="utf-8")
+    except Exception as exc:
+        print(f"artifact capture failed for {name}.html: {exc}")
 
 def load_rules():
     with open(RULES_FILE, "r", encoding="utf-8") as f:
@@ -70,11 +90,11 @@ def new_context(p):
         "height": random.choice([760, 800, 864, 900])
     }
     browser = p.chromium.launch(headless=True)
-    args = {"user_agent": ua, "viewport": vp, "locale": "en-GB"}
+    ensure_artifact_dirs()
+    args = {"user_agent": ua, "viewport": vp, "locale": "en-GB", "record_video_dir": str(VIDEO_TEMP_DIR)}
     if STATE_FILE.exists():
-        context = browser.new_context(storage_state=str(STATE_FILE), **args)
-    else:
-        context = browser.new_context(**args)
+        args["storage_state"] = str(STATE_FILE)
+    context = browser.new_context(**args)
     context.set_extra_http_headers({"Accept-Language": "en-GB,en;q=0.9"})
     return browser, context
 
@@ -129,184 +149,254 @@ def needs_login(page):
 def perform_login(page):
     if detect_captcha(page):
         raise CaptchaError("CAPTCHA encountered during login")
+
     user = os.environ["ALLOCATE_USER"]
     pw = os.environ["ALLOCATE_PASS"]
 
-    try:
-        welcome_text = page.get_by_text(re.compile("welcome to loop", re.I))
-        welcome_login_btn = page.get_by_role("button", name=re.compile("log.?in", re.I))
-        if (
-            welcome_text.count() > 0
-            and welcome_login_btn.count() > 0
-            and welcome_login_btn.first.is_visible()
-        ):
-            print("at welcome card")
-            welcome_login_btn.first.click()
-            print("clicked Log In")
-            page.wait_for_load_state("networkidle", timeout=60000)
-            micro_pause()
-    except Exception:
-        pass
+    start_time = time.monotonic()
+    deadline = start_time + 90
+    bounce_retry_used = False
 
-    auth0_container = None
-    try:
-        page.wait_for_selector(
-            ".auth0-lock-form, .auth0-lock-cred-pane-internal-wrapper",
-            state="visible",
-            timeout=60000,
-        )
-        container_candidates = page.locator(
-            ".auth0-lock-form, .auth0-lock-cred-pane-internal-wrapper"
-        )
-        if container_candidates.count() > 0:
-            auth0_container = container_candidates.first
-            print("login: at auth0 form")
-        micro_pause()
-    except PWTimeout:
-        raise AuthError("Auth0 Lock form did not appear")
-    except Exception:
-        pass
-
-    def pick_locator(kind, value):
-        locators = []
-        if kind == "css":
-            if auth0_container is not None:
-                locators.append(auth0_container.locator(value))
-            locators.append(page.locator(value))
-        elif kind == "placeholder":
-            if auth0_container is not None:
-                try:
-                    locators.append(auth0_container.get_by_placeholder(value))
-                except Exception:
-                    pass
-            locators.append(page.get_by_placeholder(value))
-        else:
+    def visible_or_none(locator):
+        try:
+            count = locator.count()
+        except Exception:
             return None
-        for loc in locators:
+        for i in range(count):
+            candidate = locator.nth(i)
             try:
-                if loc.count() > 0:
-                    return loc.first
+                if candidate.is_visible():
+                    return candidate
             except Exception:
                 continue
         return None
 
-    email_candidates = [
-        ("css", ".auth0-lock-input-email input"),
-        ("css", "input[name='email']"),
-        ("css", "input#1-email"),
-        ("css", "input[type='email']"),
-        ("placeholder", "yours@example.com"),
-    ]
-    password_candidates = [
-        ("css", ".auth0-lock-input-show-password input"),
-        ("css", "input[name='password']"),
-        ("css", "input#1-password"),
-        ("css", "input[type='password']"),
-        ("placeholder", "your password"),
-    ]
+    def find_visible_input(selectors, container=None):
+        for sel in selectors:
+            scopes = []
+            if container is not None:
+                scopes.append(container.locator(sel))
+            scopes.append(page.locator(sel))
+            for scope in scopes:
+                try:
+                    count = scope.count()
+                except Exception:
+                    continue
+                for idx in range(count):
+                    candidate = scope.nth(idx)
+                    try:
+                        candidate.wait_for(state="visible", timeout=60000)
+                        return candidate
+                    except Exception:
+                        continue
+        return None
 
-    username = None
-    for kind, val in email_candidates:
-        username = pick_locator(kind, val)
-        if username is not None:
-            break
-    if username is None:
-        raise AuthError("Email input not found")
+    while True:
+        if time.monotonic() > deadline:
+            capture_artifacts(page, "after_login")
+            raise AuthError("Login failed")
 
-    password = None
-    for kind, val in password_candidates:
-        password = pick_locator(kind, val)
-        if password is not None:
-            break
-    if password is None:
-        raise AuthError("Password input not found")
+        if detect_captcha(page):
+            capture_artifacts(page, "after_login")
+            raise CaptchaError("CAPTCHA encountered during login")
 
-    username.click()
-    micro_pause()
-    username.fill(user)
-    print("login: filled email")
-    micro_pause()
-    password.click()
-    password.fill("")
-    password.type(pw, delay=random.randint(40, 110))
-    print("login: filled password")
-    micro_pause()
+        welcome_login_btn = visible_or_none(
+            page.get_by_role("button", name=re.compile("log.?in", re.I))
+        )
+        if welcome_login_btn is not None:
+            capture_artifacts(page, "welcome")
+            try:
+                welcome_login_btn.click()
+                print("clicked Log In")
+            except Exception:
+                pass
 
-    login_btn = None
-    try:
-        if auth0_container is not None:
-            candidate = auth0_container.get_by_role(
-                "button", name=re.compile("^log.?in$", re.I)
+        time_left = deadline - time.monotonic()
+        if time_left <= 0:
+            capture_artifacts(page, "after_login")
+            raise AuthError("Login failed")
+        timeout_ms = int(min(60000, max(1000, time_left * 1000)))
+        try:
+            page.wait_for_selector(
+                ".auth0-lock-form, .auth0-lock-cred-pane-internal-wrapper",
+                state="visible",
+                timeout=timeout_ms,
             )
-            if candidate.count() > 0:
-                login_btn = candidate.first
-    except Exception:
-        pass
-    if login_btn is None:
-        candidate = page.get_by_role("button", name=re.compile("^log.?in$", re.I))
-        if candidate.count() > 0:
-            login_btn = candidate.first
-    if login_btn is None and auth0_container is not None:
-        candidate = auth0_container.locator(".auth0-lock-submit button")
-        if candidate.count() > 0:
-            login_btn = candidate.first
-    if login_btn is None:
-        candidate = page.locator(".auth0-lock-submit button")
-        if candidate.count() > 0:
-            login_btn = candidate.first
-    if login_btn is None and auth0_container is not None:
-        candidate = auth0_container.locator("button[type='submit']")
-        if candidate.count() > 0:
-            login_btn = candidate.first
-    if login_btn is None:
-        candidate = page.locator("button[type='submit']")
-        if candidate.count() > 0:
-            login_btn = candidate.first
-    if login_btn is None:
-        raise AuthError("Login button not found")
+        except PWTimeout:
+            capture_artifacts(page, "after_login")
+            raise AuthError("Auth0 Lock form did not appear")
 
-    login_btn.click()
-    print("login: submitted")
-    page.wait_for_load_state("networkidle", timeout=60000)
-    micro_pause()
+        container_candidates = page.locator(
+            ".auth0-lock-form, .auth0-lock-cred-pane-internal-wrapper"
+        )
+        auth0_container = container_candidates.first if container_candidates.count() > 0 else None
 
-    if detect_captcha(page):
-        raise CaptchaError("CAPTCHA encountered after login submit")
+        email_input = find_visible_input(
+            ["input[type='email']", "input[name='email']"],
+            container=auth0_container,
+        )
+        if email_input is None:
+            capture_artifacts(page, "after_login")
+            raise AuthError("Email input not found")
 
-    error_selectors = [
-        ".auth0-global-message",
-        ".auth0-lock-error-invalid-hint",
-    ]
-    error_messages = []
-    for sel in error_selectors:
+        password_input = find_visible_input(
+            ["input[type='password']"],
+            container=auth0_container,
+        )
+        if password_input is None:
+            capture_artifacts(page, "after_login")
+            raise AuthError("Password input not found")
+
         try:
-            loc = page.locator(sel)
-            if loc.count() > 0:
-                msg = loc.first.inner_text().strip()
-                if msg:
-                    error_messages.append(msg)
-        except Exception:
+            email_input.wait_for(state="visible", timeout=60000)
+            email_input.click()
+            micro_pause()
+            email_input.fill(user)
+            print("login: filled email")
+        except Exception as exc:
+            capture_artifacts(page, "after_login")
+            raise AuthError(f"Unable to fill email input: {exc}")
+
+        try:
+            password_input.wait_for(state="visible", timeout=60000)
+            password_input.click()
+            password_input.fill("")
+            password_input.type(pw, delay=random.randint(40, 110))
+            print("login: filled password")
+        except Exception as exc:
+            capture_artifacts(page, "after_login")
+            raise AuthError(f"Unable to fill password input: {exc}")
+
+        capture_artifacts(page, "auth0_filled")
+
+        login_button = None
+        login_candidates = [
+            page.get_by_role("button", name=re.compile("^log.?in$", re.I)),
+            page.locator(".auth0-lock-submit button"),
+            page.locator("button[type='submit']"),
+        ]
+        if auth0_container is not None:
+            login_candidates = [
+                auth0_container.get_by_role("button", name=re.compile("^log.?in$", re.I)),
+                auth0_container.locator(".auth0-lock-submit button"),
+                auth0_container.locator("button[type='submit']"),
+            ] + login_candidates
+        for candidate in login_candidates:
+            locator = visible_or_none(candidate)
+            if locator is not None:
+                login_button = locator
+                break
+        if login_button is None:
+            capture_artifacts(page, "after_login")
+            raise AuthError("Login button not found")
+
+        try:
+            login_button.wait_for(state="visible", timeout=60000)
+            login_button.click()
+            print("login: submitted")
+        except Exception as exc:
+            capture_artifacts(page, "after_login")
+            raise AuthError(f"Unable to click login button: {exc}")
+
+        capture_artifacts(page, "auth0_submitted")
+
+        submit_time = time.monotonic()
+        post_submit_captured = False
+        bounce_triggered = False
+
+        def maybe_capture_post_submit(force=False):
+            nonlocal post_submit_captured
+            if post_submit_captured:
+                return
+            elapsed = time.monotonic() - submit_time
+            if elapsed >= 10 or force:
+                wait_needed = max(0, 10 - elapsed) if force and elapsed < 10 else 0
+                if wait_needed > 0:
+                    available = max(0, deadline - time.monotonic())
+                    sleep_for = min(wait_needed, available)
+                    if sleep_for > 0:
+                        time.sleep(sleep_for)
+                capture_artifacts(page, "post_submit_wait")
+                post_submit_captured = True
+
+        while True:
+            now = time.monotonic()
+            if now > deadline:
+                maybe_capture_post_submit(force=True)
+                capture_artifacts(page, "after_login")
+                raise AuthError("Login failed")
+
+            maybe_capture_post_submit()
+
+            if detect_captcha(page):
+                maybe_capture_post_submit(force=True)
+                capture_artifacts(page, "after_login")
+                raise CaptchaError("CAPTCHA encountered after login submit")
+
+            current_url = page.url or ""
+            success = False
+            if current_url.startswith(f"{BASE_URL}/loop"):
+                try:
+                    rostering_tab = page.get_by_role("tab", name=re.compile("Rostering", re.I))
+                    if rostering_tab.count() > 0 and rostering_tab.first.is_visible():
+                        success = True
+                except Exception:
+                    pass
+            if not success:
+                try:
+                    duties_link = page.get_by_role("link", name=re.compile("Available Bank Duties", re.I))
+                    if duties_link.count() > 0 and duties_link.first.is_visible():
+                        success = True
+                except Exception:
+                    pass
+            if success:
+                maybe_capture_post_submit(force=True)
+                capture_artifacts(page, "after_login")
+                return True
+
+            error_message = None
+            error_sources = []
+            if auth0_container is not None:
+                error_sources.append(auth0_container)
+            error_sources.append(page.locator(".auth0-lock"))
+            error_sources.append(page)
+            for source in error_sources:
+                try:
+                    error_candidate = source.locator("text=/(invalid|wrong|try again)/i")
+                    if error_candidate.count() > 0:
+                        candidate = visible_or_none(error_candidate)
+                        if candidate is not None:
+                            text = candidate.inner_text().strip()
+                            if text:
+                                error_message = text
+                                break
+                except Exception:
+                    continue
+            if error_message:
+                maybe_capture_post_submit(force=True)
+                capture_artifacts(page, "after_login")
+                raise AuthError(f"Login error: {error_message}")
+
+            if not bounce_retry_used and now - submit_time >= 20:
+                welcome_again = visible_or_none(
+                    page.get_by_role("button", name=re.compile("log.?in", re.I))
+                )
+                if welcome_again is not None:
+                    print("login: bounce detected, retrying welcome card")
+                    capture_artifacts(page, "welcome")
+                    try:
+                        welcome_again.click()
+                        micro_pause()
+                    except Exception:
+                        pass
+                    bounce_retry_used = True
+                    bounce_triggered = True
+                    break
+
+            time.sleep(random.uniform(0.5, 0.8))
+
+        if bounce_triggered:
             continue
-
-    login_still_required = False
-    try:
-        login_still_required = needs_login(page)
-    except CaptchaError:
-        raise
-    except Exception:
-        pass
-    login_failed = login_still_required or bool(error_messages)
-
-    if login_failed:
-        try:
-            page.screenshot(path="login_failed.png", full_page=True)
-        except Exception as screenshot_error:
-            print(f"login: screenshot failed: {screenshot_error}")
-        for msg in error_messages:
-            print("login: error banner:", msg)
-        return False
-
-    return True
 
 
 def ensure_authenticated(page, context, relog_state, force=False):
@@ -323,9 +413,7 @@ def ensure_authenticated(page, context, relog_state, force=False):
     if relog_state.get("attempted"):
         raise AuthError("Authentication required again after retry")
     relog_state["attempted"] = True
-    success = perform_login(page)
-    if not success:
-        raise AuthError("Login failed")
+    perform_login(page)
     context.storage_state(path=str(STATE_FILE))
     micro_pause()
 
@@ -473,6 +561,22 @@ def main():
     with sync_playwright() as p:
         browser, context = new_context(p)
         page = context.new_page()
+        ensure_artifact_dirs()
+        console_log_path = ARTIFACTS_DIR / "browser-console.log"
+        console_log_path.write_text("", encoding="utf-8")
+
+        def append_console(msg):
+            try:
+                ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+                location = msg.location
+                where = f"{location.get('url', '')}:{location.get('lineNumber', '')}" if location else ""
+                with console_log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(f"{ts}\t{msg.type}\t{where}\t{msg.text}\n")
+            except Exception as exc:
+                print(f"console log write failed: {exc}")
+
+        page.on("console", append_console)
+        page_video = getattr(page, "video", None)
         try:
             page.goto(START_URL, wait_until="networkidle", timeout=60000)
             micro_pause()
@@ -495,8 +599,24 @@ def main():
                        f"<p>{str(ae)}</p><p><a href='{START_URL}'>Log in to Loop</a></p>")
             raise
         finally:
-            context.close()
-            browser.close()
+            try:
+                context.close()
+            finally:
+                browser.close()
+            if page_video is not None:
+                try:
+                    raw_path = Path(page_video.path())
+                    target_path = ARTIFACTS_DIR / "login.webm"
+                    if raw_path.exists():
+                        try:
+                            if target_path.exists():
+                                target_path.unlink()
+                            raw_path.replace(target_path)
+                        except Exception:
+                            target_path.write_bytes(raw_path.read_bytes())
+                            raw_path.unlink(missing_ok=True)
+                except Exception as exc:
+                    print(f"login video capture failed: {exc}")
 
     # Deduplicate & detect new
     current_ids = {r.get("request_id") for r in rows if r.get("request_id")}
