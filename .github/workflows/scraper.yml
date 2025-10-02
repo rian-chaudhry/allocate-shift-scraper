@@ -5,6 +5,9 @@ on:
     - cron: "*/10 7-21 * * *"   # every 10 minutes, 07:00–21:59 UTC
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 concurrency:
   group: shift-scraper
   cancel-in-progress: true
