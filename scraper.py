@@ -145,37 +145,167 @@ def perform_login(page):
             print("clicked Log In")
             page.wait_for_load_state("networkidle", timeout=60000)
             micro_pause()
-            page.wait_for_selector("input[type='password']", timeout=60000)
-            micro_pause()
     except Exception:
         pass
 
-    username = page.locator("input[autocomplete='username'], input[type='email'], input[name*='user' i]")
-    password = page.locator("input[type='password']")
-    if username.count() == 0 or password.count() == 0:
-        raise AuthError("Login form not found")
-    print("found login form")
-    username.first.click()
+    auth0_container = None
+    try:
+        page.wait_for_selector(
+            ".auth0-lock-form, .auth0-lock-cred-pane-internal-wrapper",
+            state="visible",
+            timeout=60000,
+        )
+        container_candidates = page.locator(
+            ".auth0-lock-form, .auth0-lock-cred-pane-internal-wrapper"
+        )
+        if container_candidates.count() > 0:
+            auth0_container = container_candidates.first
+            print("login: at auth0 form")
+        micro_pause()
+    except PWTimeout:
+        raise AuthError("Auth0 Lock form did not appear")
+    except Exception:
+        pass
+
+    def pick_locator(kind, value):
+        locators = []
+        if kind == "css":
+            if auth0_container is not None:
+                locators.append(auth0_container.locator(value))
+            locators.append(page.locator(value))
+        elif kind == "placeholder":
+            if auth0_container is not None:
+                try:
+                    locators.append(auth0_container.get_by_placeholder(value))
+                except Exception:
+                    pass
+            locators.append(page.get_by_placeholder(value))
+        else:
+            return None
+        for loc in locators:
+            try:
+                if loc.count() > 0:
+                    return loc.first
+            except Exception:
+                continue
+        return None
+
+    email_candidates = [
+        ("css", ".auth0-lock-input-email input"),
+        ("css", "input[name='email']"),
+        ("css", "input#1-email"),
+        ("css", "input[type='email']"),
+        ("placeholder", "yours@example.com"),
+    ]
+    password_candidates = [
+        ("css", ".auth0-lock-input-show-password input"),
+        ("css", "input[name='password']"),
+        ("css", "input#1-password"),
+        ("css", "input[type='password']"),
+        ("placeholder", "your password"),
+    ]
+
+    username = None
+    for kind, val in email_candidates:
+        username = pick_locator(kind, val)
+        if username is not None:
+            break
+    if username is None:
+        raise AuthError("Email input not found")
+
+    password = None
+    for kind, val in password_candidates:
+        password = pick_locator(kind, val)
+        if password is not None:
+            break
+    if password is None:
+        raise AuthError("Password input not found")
+
+    username.click()
     micro_pause()
-    username.first.fill(user)
+    username.fill(user)
+    print("login: filled email")
     micro_pause()
-    password.first.click()
-    password.first.fill("")
-    password.first.type(pw, delay=random.randint(40, 110))
+    password.click()
+    password.fill("")
+    password.type(pw, delay=random.randint(40, 110))
+    print("login: filled password")
     micro_pause()
-    login_btn = page.get_by_role("button", name=re.compile("log.?in", re.I))
-    if login_btn.count() == 0:
-        login_btn = page.locator("button", has_text=re.compile("log.?in", re.I))
-    if login_btn.count() == 0:
+
+    login_btn = None
+    try:
+        if auth0_container is not None:
+            candidate = auth0_container.get_by_role(
+                "button", name=re.compile("^log.?in$", re.I)
+            )
+            if candidate.count() > 0:
+                login_btn = candidate.first
+    except Exception:
+        pass
+    if login_btn is None:
+        candidate = page.get_by_role("button", name=re.compile("^log.?in$", re.I))
+        if candidate.count() > 0:
+            login_btn = candidate.first
+    if login_btn is None and auth0_container is not None:
+        candidate = auth0_container.locator(".auth0-lock-submit button")
+        if candidate.count() > 0:
+            login_btn = candidate.first
+    if login_btn is None:
+        candidate = page.locator(".auth0-lock-submit button")
+        if candidate.count() > 0:
+            login_btn = candidate.first
+    if login_btn is None and auth0_container is not None:
+        candidate = auth0_container.locator("button[type='submit']")
+        if candidate.count() > 0:
+            login_btn = candidate.first
+    if login_btn is None:
+        candidate = page.locator("button[type='submit']")
+        if candidate.count() > 0:
+            login_btn = candidate.first
+    if login_btn is None:
         raise AuthError("Login button not found")
-    login_btn.first.click()
-    print("login submitted")
+
+    login_btn.click()
+    print("login: submitted")
     page.wait_for_load_state("networkidle", timeout=60000)
     micro_pause()
+
     if detect_captcha(page):
         raise CaptchaError("CAPTCHA encountered after login submit")
-    if needs_login(page):
+
+    error_selectors = [
+        ".auth0-global-message",
+        ".auth0-lock-error-invalid-hint",
+    ]
+    error_messages = []
+    for sel in error_selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                msg = loc.first.inner_text().strip()
+                if msg:
+                    error_messages.append(msg)
+        except Exception:
+            continue
+
+    login_still_required = False
+    try:
+        login_still_required = needs_login(page)
+    except CaptchaError:
+        raise
+    except Exception:
+        pass
+    login_failed = login_still_required or bool(error_messages)
+
+    if login_failed:
+        try:
+            page.screenshot(path="login_failed.png", full_page=True)
+        except Exception as screenshot_error:
+            print(f"login: screenshot failed: {screenshot_error}")
+        for msg in error_messages:
+            print("login: error banner:", msg)
         return False
+
     return True
 
 
