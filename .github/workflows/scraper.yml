@@ -2,7 +2,10 @@ name: shift-scraper
 
 on:
   schedule:
-    - cron: "*/10 7-21 * * *"   # every 10 minutes, 07:00–21:59 UTC
+    # BST window (06:00–21:59 UTC ≈ 07:00–22:59 UK in summer)
+    - cron: "*/10 6-21 * * *"
+    # GMT window (07:00–21:59 UTC ≈ 07:00–21:59 UK in winter)
+    - cron: "*/10 7-21 * * *"
   workflow_dispatch:
 
 permissions:
@@ -11,21 +14,21 @@ permissions:
 concurrency:
   group: shift-scraper
   cancel-in-progress: true
-
+ 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
 
     steps:
-      - name: Jitter 4–37s to avoid perfect regularity
-        run: |
-          python - <<'PY'
-          import random, time
-          t = random.uniform(4, 37)
-          print(f"jitter: sleeping {t:.1f}s before scrape")
-          time.sleep(t)
-          PY
+     - name: Jitter 4–37s to avoid perfect regularity
+  run: |
+    python - <<'PY'
+    import random, time
+    t = random.uniform(4, 37)
+    print(f"jitter: sleeping {t:.1f}s before scrape")
+    time.sleep(t)
+    PY
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -68,13 +71,13 @@ jobs:
           SMTP_TO:       ${{ secrets.SMTP_TO }}
         run: python scraper.py
 
-      - name: Upload screenshots (if any)
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scraper-screens
-          path: |
-            *.png
+          name: scraper-artifacts
+          path: artifacts
+          if-no-files-found: ignore
 
       - name: Persist state files back to repo (seen_ids & storage_state)
         if: always()
