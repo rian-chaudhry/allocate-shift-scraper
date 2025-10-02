@@ -1,0 +1,22 @@
+rules:
+  - name: Priority day shifts
+    unit_in:
+      - "LAN - MK General Medicine"
+      - "LAN - WG Gen Surgery"
+      - "IRH - Acute Med"
+    start_end_contains_any:
+      - "09:00 - 17:00"
+      - "08:00 - 16:00"
+    grade_in:
+      - "FY2"
+      - "StR Lower"
+    action: "priority"
+
+  - name: Late/night shifts
+    start_end_contains_any:
+      - "17:00 - 21:15"
+      - "20:30 - 09:00"
+    action: "late"
+
+  - name: Ignore everything else
+    action: "ignore"
