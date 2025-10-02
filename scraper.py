@@ -496,20 +496,86 @@ def ensure_authenticated(page, context, relog_state, force=False):
     micro_pause()
 
 def go_to_available_duties(page, keep_auth):
+    def log(m): print(f"[nav] {m}")
     keep_auth()
-    print("navigating to Available Bank Duties")
-    # Side menu → "Available Bank Duties"
-    # Many Allocate skins use role="link" with visible name; fallback to text search.
+    log("navigating to Available Bank Duties")
+
+    # 1) Make sure the 'Rostering' area is active (top bar tab or link).
+    # Try several variants seen across skins.
+    for cand in [
+        page.get_by_role("tab",  name=re.compile(r"rostering", re.I)),
+        page.get_by_role("link", name=re.compile(r"rostering", re.I)),
+        page.locator("a:has-text('Rostering')"),
+        page.locator("button:has-text('Rostering')"),
+        page.get_by_text(re.compile(r"^\s*Rostering\s*$", re.I)).locator("xpath=ancestor::*[self::a or self::button][1]"),
+    ]:
+        try:
+            if cand.count() > 0 and cand.first.is_visible():
+                cand.first.click(timeout=8000)
+                micro_pause()
+                break
+        except Exception:
+            pass
+
+    keep_auth()
+    # Let the left nav settle.
     try:
-        page.get_by_role("link", name=re.compile("Rostering", re.I)).click(timeout=4000)
-        micro_pause()
-        keep_auth()
-    except PWTimeout:
+        page.wait_for_load_state("networkidle")
+    except Exception:
         pass
-    page.get_by_role("link", name=re.compile("Available Bank Duties", re.I)).click(timeout=15000)
+    page.wait_for_timeout(500)
+
+    # 2) Find the left-nav link for "Available Bank Duties".
+    # Based on your screenshot the anchor often has class 'bankShifts' and href containing 'BankShifts'.
+    nav_scopes = [
+        page.locator("nav"),
+        page.locator("aside"),
+        page.locator(".loop-trust-primary-nav, .left-nav, .menu, .navigation, .side-nav"),
+        page,  # fallback
+    ]
+    target = None
+    for scope in nav_scopes:
+        for cand in [
+            scope.get_by_role("link", name=re.compile(r"\bAvailable Bank Duties\b", re.I)),
+            scope.locator("a.bankShifts"),
+            scope.locator("a[href*='BankShifts']"),
+            scope.locator("a:has-text('Available Bank Duties')"),
+            scope.locator("[role=menuitem]:has-text('Available Bank Duties')"),
+            scope.get_by_role("link", name=re.compile(r"Available.*Duties", re.I)),
+        ]:
+            try:
+                if cand.count() > 0 and cand.first.is_visible():
+                    target = cand.first
+                    break
+            except Exception:
+                continue
+        if target:
+            break
+
+    if not target:
+        # Write out everything we can see in the left nav to help selector tuning.
+        capture_artifacts(page, "rostering_nav_not_found")
+        try:
+            left_dump = []
+            for scope in nav_scopes:
+                try:
+                    left_dump += scope.locator("a, [role=link], [role=menuitem]").all_inner_texts()
+                except Exception:
+                    pass
+            (ARTIFACTS_DIR / "left-nav-links.txt").write_text("\n".join(left_dump), encoding="utf-8")
+        except Exception:
+            pass
+        raise AuthError("Could not find 'Available Bank Duties' after opening Rostering")
+
+    log("clicking 'Available Bank Duties'")
+    try:
+        target.scroll_into_view_if_needed(timeout=5000)
+    except Exception:
+        pass
+    target.click(timeout=30000)
     micro_pause()
     keep_auth()
-    page.wait_for_selector("table", timeout=15000)
+    page.wait_for_selector("table, [role='table']", timeout=20000)
     keep_auth()
 
 def read_table_rows(page):
@@ -638,6 +704,11 @@ def main():
 
     with sync_playwright() as p:
         browser, context = new_context(p)
+        # Start Playwright trace for post-mortem debugging.
+        try:
+            context.tracing.start(screenshots=True, snapshots=True, sources=False)
+        except Exception as _exc:
+            print(f"trace start failed: {_exc}")
         page = context.new_page()
         ensure_artifact_dirs()
         console_log_path = ARTIFACTS_DIR / "browser-console.log"
@@ -695,6 +766,11 @@ def main():
                             raw_path.unlink(missing_ok=True)
                 except Exception as exc:
                     print(f"login video capture failed: {exc}")
+            # Save the trace so we can inspect failures in the trace viewer.
+            try:
+                context.tracing.stop(path=str(ARTIFACTS_DIR / "trace.zip"))
+            except Exception as _exc:
+                print(f"trace save failed: {_exc}")
 
     # Deduplicate & detect new
     current_ids = {r.get("request_id") for r in rows if r.get("request_id")}
