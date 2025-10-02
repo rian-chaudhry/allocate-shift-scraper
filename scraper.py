@@ -1,4 +1,4 @@
-import os, re, ssl, smtplib, json, random, time, sys
+import os, re, ssl, smtplib, json, random, time, traceback
 from pathlib import Path
 from email.mime.text import MIMEText
 import yaml
@@ -6,6 +6,7 @@ import yaml
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 BASE_URL = "https://web.loop.allocate-cloud.co.uk"
+START_URL = f"{BASE_URL}/loop"
 
 ROOT = Path(__file__).parent
 STATE_FILE = ROOT / "storage_state.json"     # Playwright session (persisted to repo)
@@ -23,6 +24,10 @@ def jitter_sleep():
     # 30–120s jitter so we don't look like a metronome
     delay = random.uniform(30, 120)
     time.sleep(delay)
+
+
+def micro_pause():
+    time.sleep(random.uniform(0.3, 1.1))
 
 def load_rules():
     with open(RULES_FILE, "r", encoding="utf-8") as f:
@@ -72,30 +77,119 @@ def new_context(p):
     context.set_extra_http_headers({"Accept-Language": "en-GB,en;q=0.9"})
     return browser, context
 
-def login_if_needed(page):
-    page.goto(BASE_URL, wait_until="networkidle", timeout=60000)
-    # crude detection of login form
-    if "login" in page.url.lower() or page.locator("input[type='password']").count() > 0:
-        user = os.environ["ALLOCATE_USER"]
-        pw = os.environ["ALLOCATE_PASS"]
-        # label/placeholder selectors are more robust across Allocate skins
-        username = page.locator("input[autocomplete='username'], input[type='email'], input[name*='user' i]")
-        password = page.locator("input[type='password']")
-        username.fill(user)
-        time.sleep(random.uniform(0.2, 0.7))
-        password.type(pw, delay=random.randint(40, 120))
-        page.get_by_role("button", name=re.compile("log.?in", re.I)).click()
-        page.wait_for_load_state("networkidle", timeout=60000)
+class AuthError(Exception):
+    pass
 
-def go_to_available_duties(page):
+
+class CaptchaError(Exception):
+    pass
+
+
+def detect_captcha(page):
+    selectors = [
+        "iframe[src*='captcha' i]",
+        "[class*='captcha' i]",
+        "text=/i am not a robot/i",
+        "text=/captcha/i",
+    ]
+    for sel in selectors:
+        try:
+            if page.locator(sel).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def needs_login(page):
+    try:
+        if detect_captcha(page):
+            raise CaptchaError("CAPTCHA encountered")
+    except CaptchaError:
+        raise
+    except Exception:
+        pass
+    url = (page.url or "").lower()
+    if "login" in url:
+        return True
+    try:
+        if page.locator("input[type='password']").count() > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        if page.locator("text=/welcome to loop/i").count() > 0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def perform_login(page):
+    if detect_captcha(page):
+        raise CaptchaError("CAPTCHA encountered during login")
+    user = os.environ["ALLOCATE_USER"]
+    pw = os.environ["ALLOCATE_PASS"]
+    username = page.locator("input[autocomplete='username'], input[type='email'], input[name*='user' i]")
+    password = page.locator("input[type='password']")
+    if username.count() == 0 or password.count() == 0:
+        raise AuthError("Login form not found")
+    username.first.click()
+    micro_pause()
+    username.first.fill(user)
+    micro_pause()
+    password.first.click()
+    password.first.fill("")
+    password.first.type(pw, delay=random.randint(40, 110))
+    micro_pause()
+    login_btn = page.get_by_role("button", name=re.compile("log.?in", re.I))
+    if login_btn.count() == 0:
+        login_btn = page.locator("button", has_text=re.compile("log.?in", re.I))
+    if login_btn.count() == 0:
+        raise AuthError("Login button not found")
+    login_btn.first.click()
+    page.wait_for_load_state("networkidle", timeout=60000)
+    micro_pause()
+    if detect_captcha(page):
+        raise CaptchaError("CAPTCHA encountered after login submit")
+    return not needs_login(page)
+
+
+def ensure_authenticated(page, context, relog_state, force=False):
+    try:
+        login_required = needs_login(page)
+    except CaptchaError:
+        raise
+    if not login_required and not force:
+        return
+    if not login_required and force:
+        return
+    if detect_captcha(page):
+        raise CaptchaError("CAPTCHA encountered")
+    if relog_state.get("attempted"):
+        raise AuthError("Authentication required again after retry")
+    relog_state["attempted"] = True
+    success = perform_login(page)
+    if not success:
+        raise AuthError("Login failed")
+    context.storage_state(path=str(STATE_FILE))
+    micro_pause()
+
+def go_to_available_duties(page, keep_auth):
+    keep_auth()
     # Side menu → "Available Bank Duties"
     # Many Allocate skins use role="link" with visible name; fallback to text search.
     try:
         page.get_by_role("link", name=re.compile("Rostering", re.I)).click(timeout=4000)
+        micro_pause()
+        keep_auth()
     except PWTimeout:
         pass
     page.get_by_role("link", name=re.compile("Available Bank Duties", re.I)).click(timeout=15000)
+    micro_pause()
+    keep_auth()
     page.wait_for_selector("table", timeout=15000)
+    keep_auth()
 
 def read_table_rows(page):
     # Build header → index map
@@ -126,9 +220,10 @@ def read_table_rows(page):
         rows.append(row)
     return rows
 
-def paginate_collect(page):
+def paginate_collect(page, keep_auth):
     all_rows = []
     while True:
+        keep_auth()
         all_rows.extend(read_table_rows(page))
         # try to find a "Next" control; various Allocate themes vary
         next_btn = page.get_by_role("button", name=re.compile(r"(next|›|>)", re.I))
@@ -140,6 +235,7 @@ def paginate_collect(page):
             break
         try:
             next_btn.first.click(timeout=1500)
+            micro_pause()
             page.wait_for_load_state("networkidle")
             page.wait_for_selector("table", timeout=10000)
         except Exception:
@@ -176,17 +272,21 @@ def select_period(page, widget, item):
         handle.select_option(item["value"])
     else:
         handle.click()
+        micro_pause()
         page.get_by_role("option", name=re.compile(re.escape(item), re.I)).click()
+    micro_pause()
     page.wait_for_load_state("networkidle")
     page.wait_for_selector("table", timeout=15000)
 
-def scrape_all_periods(page):
+def scrape_all_periods(page, keep_auth):
     widget = get_period_widget(page)
     options = widget[2]
     all_rows = []
     for item in options:
+        keep_auth()
         select_period(page, widget, item)
-        all_rows.extend(paginate_collect(page))
+        keep_auth()
+        all_rows.extend(paginate_collect(page, keep_auth))
     return all_rows
 
 def match_action(r, rules):
@@ -213,14 +313,32 @@ def main():
     rules = load_rules()
     seen = load_seen()
 
+    relog_state = {"attempted": False}
+
     with sync_playwright() as p:
         browser, context = new_context(p)
         page = context.new_page()
         try:
-            login_if_needed(page)
+            page.goto(START_URL, wait_until="networkidle", timeout=60000)
+            micro_pause()
+            ensure_authenticated(page, context, relog_state, force=True)
             context.storage_state(path=str(STATE_FILE))
-            go_to_available_duties(page)
-            rows = scrape_all_periods(page)
+
+            def keep_auth():
+                ensure_authenticated(page, context, relog_state)
+
+            keep_auth()
+            go_to_available_duties(page, keep_auth)
+            keep_auth()
+            rows = scrape_all_periods(page, keep_auth)
+            context.storage_state(path=str(STATE_FILE))
+        except CaptchaError as ce:
+            send_email("⚠️ CAPTCHA encountered – manual login needed", f"<p>{str(ce)}</p>")
+            raise
+        except AuthError as ae:
+            send_email("⚠️ Re-auth required (Loop)",
+                       f"<p>{str(ae)}</p><p><a href='{START_URL}'>Log in to Loop</a></p>")
+            raise
         finally:
             context.close()
             browser.close()
@@ -261,10 +379,16 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except Exception as e:
+    except CaptchaError:
+        # already handled above
+        pass
+    except AuthError:
+        # already handled above
+        pass
+    except Exception:
         # fail-safe email so you know it broke
         try:
-            send_email("⚠️ Shift scraper failed", f"<pre>{str(e)}</pre>")
+            send_email("⚠️ Shift scraper failed", f"<pre>{traceback.format_exc()}</pre>")
         except Exception:
             pass
         raise
