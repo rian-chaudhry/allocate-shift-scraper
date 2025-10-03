@@ -504,13 +504,36 @@ def go_to_available_duties(page, keep_auth):
     bank_href = f"{BASE_URL}/EmployeeOnlineHealth/GGCLIVE/Roster/BankShifts"
     log("skipping menu navigation; loading BankShifts URL directly")
     page.goto(bank_href, wait_until="networkidle", timeout=30000)
-    page.wait_for_selector("table, [role='table'], text=/Choose Period/i", timeout=25000)
+    # Wait for the bank duties table/ grid to render (or the "Choose Period" control).
+    page.wait_for_load_state("domcontentloaded")
+
+    # Prefer the grid/table; this uses only CSS so commas are fine.
+    table_like = page.locator(":is([role='grid'], [role='table'], table)").first
+    try:
+        table_like.wait_for(state="visible", timeout=25_000)
+    except Exception:
+        # Fallback: wait for the "Choose Period" control by text, using the text engine (separate locator)
+        page.get_by_text("Choose Period", exact=False).wait_for(timeout=10_000)
     keep_auth()
 
+
+def _find_bank_table(page):
+    # One locator that works for both semantic tables and ARIA grids
+    return page.locator(":is([role='grid'], [role='table'], table)").first
+
+
+def read_table_headers(table_locator):
+    # Support both <th> and [role=columnheader]
+    header_cells = table_locator.locator(":is(thead th, [role='columnheader'])")
+    return [h.inner_text().strip() for h in header_cells.all()]
+
+
 def read_table_rows(page):
+    table = _find_bank_table(page)
+    table.wait_for(state="visible", timeout=15_000)
+
     # Build header → index map
-    headers = [page.locator("table thead th").nth(i).inner_text().strip()
-               for i in range(page.locator("table thead th").count())]
+    headers = read_table_headers(table)
     def col(rx):
         for i,h in enumerate(headers):
             if re.search(rx, h, re.I):
@@ -527,10 +550,14 @@ def read_table_rows(page):
         "grade":      col(r"Grade"),
     }
     rows = []
-    body = page.locator("table tbody tr")
-    for r in range(body.count()):
+    row_locs = table.locator(":is(tbody tr, [role='row'])")
+    for row_loc in row_locs.all():
+        cell_locs = row_loc.locator(":is(td, [role='gridcell'])")
+        cells = [c.inner_text().strip() for c in cell_locs.all()]
+        if not cells:
+            continue
         def cell(i):
-            return body.nth(r).locator("td").nth(i).inner_text().strip() if i is not None else ""
+            return cells[i] if i is not None and i < len(cells) else ""
         row = {k: cell(v) for k, v in idx.items()}
         row["start_end"] = re.sub(r"\s+", " ", row["start_end"])
         rows.append(row)
@@ -553,7 +580,8 @@ def paginate_collect(page, keep_auth):
             next_btn.first.click(timeout=1500)
             micro_pause()
             page.wait_for_load_state("networkidle")
-            page.wait_for_selector("table", timeout=10000)
+            table = _find_bank_table(page)
+            table.wait_for(state="visible", timeout=15_000)
         except Exception:
             break
     return all_rows
@@ -592,7 +620,8 @@ def select_period(page, widget, item):
         page.get_by_role("option", name=re.compile(re.escape(item), re.I)).click()
     micro_pause()
     page.wait_for_load_state("networkidle")
-    page.wait_for_selector("table", timeout=15000)
+    table = _find_bank_table(page)
+    table.wait_for(state="visible", timeout=15_000)
 
 def scrape_all_periods(page, keep_auth):
     widget = get_period_widget(page)
